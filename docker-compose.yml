@@ -1,0 +1,116 @@
+version: "3.9"
+
+# Shared build context helper: each service image gets both the service
+# directory and the shared/ library copied in during the build.
+x-shared-context: &shared-context
+  context: .
+  args:
+    - BUILDKIT_INLINE_CACHE=1
+
+services:
+  # -------------------------------------------------------------------------
+  # Local DynamoDB (for development without AWS)
+  # -------------------------------------------------------------------------
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.4.0
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/shell/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # Ingestion Service
+  # -------------------------------------------------------------------------
+  ingestion-service:
+    build:
+      <<: *shared-context
+      dockerfile: ingestion-service/Dockerfile
+    env_file: .env
+    environment:
+      - VECTOR_STORE_PATH=/app/data/faiss_index
+      - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+    volumes:
+      - faiss_data:/app/data/faiss_index
+    ports:
+      - "8001:8001"
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # MCP Server
+  # -------------------------------------------------------------------------
+  mcp-server:
+    build:
+      <<: *shared-context
+      dockerfile: mcp-server/Dockerfile
+    env_file: .env
+    environment:
+      - INGESTION_SERVICE_URL=http://ingestion-service:8001
+    ports:
+      - "8003:8003"
+    depends_on:
+      ingestion-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8003/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # Agent Orchestrator
+  # -------------------------------------------------------------------------
+  agent-orchestrator:
+    build:
+      <<: *shared-context
+      dockerfile: agent-orchestrator/Dockerfile
+    env_file: .env
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:8003
+    ports:
+      - "8002:8002"
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # Chat Service  (public-facing entry point)
+  # -------------------------------------------------------------------------
+  chat-service:
+    build:
+      <<: *shared-context
+      dockerfile: chat-service/Dockerfile
+    env_file: .env
+    environment:
+      - AGENT_ORCHESTRATOR_URL=http://agent-orchestrator:8002
+      - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+    ports:
+      - "8080:8000"
+    depends_on:
+      agent-orchestrator:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  faiss_data:
